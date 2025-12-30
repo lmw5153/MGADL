@@ -414,3 +414,5 @@ else:
             reset_all()
             st.rerun()
 
+            st.rerun()
+
