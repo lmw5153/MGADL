@@ -12,13 +12,11 @@ from google.oauth2.service_account import Credentials
 # =========================
 st.set_page_config(page_title="MG-ADL 설문", page_icon="🧠", layout="centered")
 
-# Secrets에서 읽기 (없으면 기본값)
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "0712")
 SHEET_ID = st.secrets.get("SHEET_ID", "")
 WORKSHEET_NAME = st.secrets.get("WORKSHEET_NAME", "responses")
 SALT = st.secrets.get("SALT", "")
 
-# 서비스계정 정보는 Secrets에만!
 SA_INFO = st.secrets.get("GOOGLE_SERVICE_ACCOUNT", None)
 
 
@@ -76,22 +74,23 @@ ITEMS = [
     }},
 ]
 
-HEADER = (
+# "우리 앱이 기대하는 헤더"
+EXPECTED_HEADER = (
     ["created_at", "name", "dob", "patient_hash", "total_score"]
     + [it["id"] for it in ITEMS]
 )
 
 
 # =========================
-# 유틸 함수
+# 유틸
 # =========================
+def compute_total(responses: dict) -> int:
+    return int(sum(int(v) for v in responses.values()))
+
+
 def patient_hash(name: str, dob: str) -> str:
     raw = f"{name}|{dob}|{SALT}".encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:16]
-
-
-def compute_total(responses: dict) -> int:
-    return int(sum(int(v) for v in responses.values()))
 
 
 @st.cache_resource(show_spinner=False)
@@ -113,33 +112,68 @@ def get_worksheet():
     try:
         ws = sh.worksheet(WORKSHEET_NAME)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=WORKSHEET_NAME, rows=2000, cols=50)
+        ws = sh.add_worksheet(title=WORKSHEET_NAME, rows=2000, cols=80)
     return ws
 
 
 def ensure_header(ws):
+    """
+    - 시트 비어있으면 EXPECTED_HEADER로 생성
+    - 기존 헤더가 있고, EXPECTED_HEADER에 있는 컬럼이 빠져있으면 자동으로 뒤에 추가
+    - 이후 append는 "현재 헤더(1행)" 기준으로 record.get()로 안전 매핑
+    """
     values = ws.get_all_values()
     if len(values) == 0:
-        ws.append_row(HEADER, value_input_option="USER_ENTERED")
+        ws.append_row(EXPECTED_HEADER, value_input_option="USER_ENTERED")
+        return EXPECTED_HEADER
+
+    current = ws.row_values(1)
+    # current가 비어있는 경우(가끔)
+    if not current:
+        ws.update("1:1", [EXPECTED_HEADER])
+        return EXPECTED_HEADER
+
+    missing = [h for h in EXPECTED_HEADER if h not in current]
+    if missing:
+        new_header = current + missing
+        ws.update("1:1", [new_header])
+        return new_header
+
+    return current
 
 
 def append_record_to_sheet(record: dict):
     """
-    record: HEADER 키들을 모두 포함해야 함.
+    record는 최소한 EXPECTED_HEADER의 key를 갖는 dict.
+    실제 append는 "현재 시트의 헤더"에 맞춰 column-safe하게 수행.
     """
     ws = get_worksheet()
-    ensure_header(ws)
-    ws.append_row([record[k] for k in HEADER], value_input_option="USER_ENTERED")
+    current_header = ensure_header(ws)
+
+    row = [record.get(h, "") for h in current_header]
+    res = ws.append_row(row, value_input_option="USER_ENTERED")
+
+    # 디버그/확인용 반환
+    updated_range = None
+    if isinstance(res, dict):
+        updated_range = res.get("updates", {}).get("updatedRange")
+
+    return {
+        "spreadsheet_title": ws.spreadsheet.title,
+        "worksheet_title": ws.title,
+        "updated_range": updated_range,
+        "header_len": len(current_header),
+    }
 
 
 # =========================
-# 세션 초기화
+# 세션 상태
 # =========================
 if "authed" not in st.session_state:
     st.session_state.authed = False
 
 if "patient" not in st.session_state:
-    st.session_state.patient = {"name": "", "dob": ""}  # dob: YYYY-MM-DD
+    st.session_state.patient = {"name": "", "dob": ""}
 
 if "responses" not in st.session_state:
     st.session_state.responses = {}
@@ -156,10 +190,10 @@ def reset_all():
 
 
 # =========================
-# UI: 헤더 / 메뉴
+# UI
 # =========================
 st.title("🧠 MG-ADL 설문")
-st.caption("1) 비밀번호/정보 → 2) 설문 → 3) 결과/저장 (Google Sheet 누적)")
+st.caption("1) 비밀번호/정보 → 2) 설문 → 3) 결과/저장 (Google Sheets 누적 저장)")
 
 with st.sidebar:
     st.subheader("메뉴")
@@ -176,21 +210,20 @@ with st.sidebar:
             reset_all()
             st.rerun()
 
-
-# 인증 안 됐으면 2/3 페이지 차단
+# 인증 안됐으면 2/3 차단
 if not st.session_state.authed and page != "1) 이름/생년월일":
     st.warning("먼저 1) 페이지에서 비밀번호 인증을 완료해주세요.")
     st.stop()
 
 
 # =========================
-# 페이지 1) 비밀번호 + 이름/생년월일
+# 페이지 1
 # =========================
 if page == "1) 이름/생년월일":
     st.header("1) 대상자 정보 입력")
 
     if not st.session_state.authed:
-        st.info("접속 비밀번호를 입력해야 다음 단계로 진행할 수 있습니다.")
+        st.info("접속 비밀번호(0712)를 입력해야 다음 단계로 진행할 수 있습니다.")
         with st.form("auth_form"):
             pw = st.text_input("접속 비밀번호", type="password", placeholder="0712")
             ok = st.form_submit_button("인증")
@@ -224,7 +257,7 @@ if page == "1) 이름/생년월일":
 
 
 # =========================
-# 페이지 2) 설문
+# 페이지 2
 # =========================
 elif page == "2) 설문":
     st.header("2) MG-ADL 설문")
@@ -264,7 +297,7 @@ elif page == "2) 설문":
 
 
 # =========================
-# 페이지 3) 결과 계산 + Google Sheet 저장(누적 append)
+# 페이지 3
 # =========================
 else:
     st.header("3) 결과/저장")
@@ -282,7 +315,6 @@ else:
     st.subheader("결과")
     st.metric("MG-ADL 총점", f"{total} / 24")
 
-    # 문항별 요약
     rows = []
     for item in ITEMS:
         sc = int(st.session_state.responses.get(item["id"], 0))
@@ -290,10 +322,10 @@ else:
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
     st.divider()
-    st.subheader("Google Sheet 누적 저장(append)")
-    st.caption("아래 버튼을 누를 때마다 스프레드시트에 **새 행으로 계속 누적** 저장됩니다.")
+    st.subheader("Google Sheets 누적 저장(append)")
+    st.caption("‘결과 저장’을 누를 때마다 스프레드시트에 **새 행으로 누적** 저장됩니다.")
 
-    # 저장 레코드 구성 (HEADER 순서대로)
+    # record 구성: EXPECTED_HEADER 키를 모두 포함
     record = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "name": name,
@@ -304,12 +336,13 @@ else:
     for it in ITEMS:
         record[it["id"]] = int(st.session_state.responses.get(it["id"], 0))
 
-    # Secrets/권한 안내(초기 디버그 도움)
-    with st.expander("연동 상태 점검(문제 있을 때 확인)"):
+    with st.expander("연동 상태 점검"):
         st.write("- SHEET_ID 설정:", "✅" if bool(SHEET_ID) else "⛔ 없음")
         st.write("- GOOGLE_SERVICE_ACCOUNT 설정:", "✅" if (SA_INFO is not None) else "⛔ 없음")
         st.write("- WORKSHEET_NAME:", WORKSHEET_NAME)
-        st.write("※ 스프레드시트 공유에서 서비스계정 이메일을 **편집자**로 추가했는지 확인하세요.")
+        if SA_INFO and isinstance(SA_INFO, dict):
+            st.write("- service account:", SA_INFO.get("client_email", "(unknown)"))
+        st.caption("※ 구글시트 공유에서 서비스계정 이메일을 **편집자**로 추가했는지 확인하세요.")
 
     colA, colB = st.columns(2)
     with colA:
@@ -321,11 +354,18 @@ else:
 
     if save_clicked:
         try:
-            append_record_to_sheet(record)
+            info = append_record_to_sheet(record)
             st.session_state.saved = True
-            st.success(f"저장 완료! (patient_hash: {ph})")
+            st.success("저장 완료!")
+
+            st.write("📌 저장된 위치")
+            st.write("스프레드시트:", info["spreadsheet_title"])
+            st.write("탭(워크시트):", info["worksheet_title"])
+            if info["updated_range"]:
+                st.write("업데이트 범위:", info["updated_range"])
+
         except Exception as e:
-            st.error("저장 실패: Secrets 설정/시트 공유 권한/탭 이름을 확인하세요.")
+            st.error("저장 실패: Secrets 설정/시트 공유 권한/SHEET_ID/탭 이름을 확인하세요.")
             st.exception(e)
 
     st.divider()
