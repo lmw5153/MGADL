@@ -11,7 +11,7 @@ from google.oauth2.service_account import Credentials
 # =========================
 # 설정 / Secrets
 # =========================
-st.set_page_config(page_title="MG-ADL 설문", page_icon="🧠", layout="centered")
+st.set_page_config(page_title="MG-ADL 설문지 - Vestibular LAB", page_icon="🧠", layout="centered")
 
 APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")  # 비번은 Secrets에서만 관리 (화면 힌트 없음)
 SHEET_ID = st.secrets.get("SHEET_ID", "")
@@ -245,8 +245,8 @@ def reset_all():
 # =========================
 # UI 공통
 # =========================
-st.title("🧠 MG-ADL 설문")
-st.caption("하단 ‘완료’ 버튼으로만 다음 단계로 이동합니다.")
+st.title("MG-ADL 설문지 - Vestibular LAB")
+st.caption("MG-ADL 설문지 온라인 웹 서비스입니다.")
 progress_map = {1: 33, 2: 66, 3: 100}
 st.progress(progress_map.get(st.session_state.step, 0))
 
