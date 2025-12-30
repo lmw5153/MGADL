@@ -13,22 +13,7 @@ from datetime import datetime
 import hashlib
 import gspread
 from google.oauth2.service_account import Credentials
-SHEET_ID = "스프레드시트ID를여기에"
-WORKSHEET_NAME = "responses"
-SALT = "원하면_가명처리용_임의문자열"
 
-# 서비스계정 JSON 내용을 그대로 TOML로 옮겨 담기 (중요: 줄바꿈/따옴표 유지)
-[GOOGLE_SERVICE_ACCOUNT]
-type = "service_account"
-project_id = "..."
-private_key_id = "..."
-private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-client_email = "xxx@xxx.iam.gserviceaccount.com"
-client_id = "..."
-auth_uri = "https://accounts.google.com/o/oauth2/auth"
-token_uri = "https://oauth2.googleapis.com/token"
-auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
-client_x509_cert_url = "..."
 # -----------------------------
 # 기본 설정
 # -----------------------------
