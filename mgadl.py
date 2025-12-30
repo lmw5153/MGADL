@@ -2,13 +2,14 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import hashlib
+import json
 
 import gspread
 from google.oauth2.service_account import Credentials
 
 
 # =========================
-# 기본 설정 / Secrets
+# 설정 / Secrets
 # =========================
 st.set_page_config(page_title="MG-ADL 설문", page_icon="🧠", layout="centered")
 
@@ -16,7 +17,6 @@ APP_PASSWORD = st.secrets.get("APP_PASSWORD", "0712")
 SHEET_ID = st.secrets.get("SHEET_ID", "")
 WORKSHEET_NAME = st.secrets.get("WORKSHEET_NAME", "responses")
 SALT = st.secrets.get("SALT", "")
-
 SA_INFO = st.secrets.get("GOOGLE_SERVICE_ACCOUNT", None)
 
 
@@ -74,9 +74,8 @@ ITEMS = [
     }},
 ]
 
-# "우리 앱이 기대하는 헤더"
 EXPECTED_HEADER = (
-    ["created_at", "name", "dob", "patient_hash", "total_score"]
+    ["created_at", "submission_id", "name", "dob", "patient_hash", "total_score"]
     + [it["id"] for it in ITEMS]
 )
 
@@ -88,8 +87,15 @@ def compute_total(responses: dict) -> int:
     return int(sum(int(v) for v in responses.values()))
 
 
-def patient_hash(name: str, dob: str) -> str:
+def make_patient_hash(name: str, dob: str) -> str:
     raw = f"{name}|{dob}|{SALT}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def make_submission_id(patient_hash: str, created_at: str, responses: dict) -> str:
+    # 설문 한 번 제출(페이지2 완료 클릭) 단위를 고유하게 식별
+    payload = json.dumps(responses, sort_keys=True, ensure_ascii=False)
+    raw = f"{patient_hash}|{created_at}|{payload}".encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
@@ -104,31 +110,23 @@ def _get_gspread_client():
 
 def get_worksheet():
     if not SHEET_ID:
-        raise RuntimeError("Secrets에 SHEET_ID가 없습니다.")
+        raise RuntimeError("Secrets에 SHEET_ID가 없습니다. (스프레드시트 ID만 입력)")
     gc = _get_gspread_client()
     sh = gc.open_by_key(SHEET_ID)
-
-    # 탭 없으면 생성
     try:
         ws = sh.worksheet(WORKSHEET_NAME)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=WORKSHEET_NAME, rows=2000, cols=80)
+        ws = sh.add_worksheet(title=WORKSHEET_NAME, rows=2000, cols=100)
     return ws
 
 
 def ensure_header(ws):
-    """
-    - 시트 비어있으면 EXPECTED_HEADER로 생성
-    - 기존 헤더가 있고, EXPECTED_HEADER에 있는 컬럼이 빠져있으면 자동으로 뒤에 추가
-    - 이후 append는 "현재 헤더(1행)" 기준으로 record.get()로 안전 매핑
-    """
     values = ws.get_all_values()
     if len(values) == 0:
         ws.append_row(EXPECTED_HEADER, value_input_option="USER_ENTERED")
         return EXPECTED_HEADER
 
     current = ws.row_values(1)
-    # current가 비어있는 경우(가끔)
     if not current:
         ws.update("1:1", [EXPECTED_HEADER])
         return EXPECTED_HEADER
@@ -143,17 +141,11 @@ def ensure_header(ws):
 
 
 def append_record_to_sheet(record: dict):
-    """
-    record는 최소한 EXPECTED_HEADER의 key를 갖는 dict.
-    실제 append는 "현재 시트의 헤더"에 맞춰 column-safe하게 수행.
-    """
     ws = get_worksheet()
-    current_header = ensure_header(ws)
-
-    row = [record.get(h, "") for h in current_header]
+    header = ensure_header(ws)
+    row = [record.get(h, "") for h in header]
     res = ws.append_row(row, value_input_option="USER_ENTERED")
 
-    # 디버그/확인용 반환
     updated_range = None
     if isinstance(res, dict):
         updated_range = res.get("updates", {}).get("updatedRange")
@@ -162,13 +154,15 @@ def append_record_to_sheet(record: dict):
         "spreadsheet_title": ws.spreadsheet.title,
         "worksheet_title": ws.title,
         "updated_range": updated_range,
-        "header_len": len(current_header),
     }
 
 
 # =========================
 # 세션 상태
 # =========================
+if "step" not in st.session_state:
+    st.session_state.step = 1  # 1: 인증+정보, 2: 설문, 3: 결과/전송
+
 if "authed" not in st.session_state:
     st.session_state.authed = False
 
@@ -178,93 +172,93 @@ if "patient" not in st.session_state:
 if "responses" not in st.session_state:
     st.session_state.responses = {}
 
-if "saved" not in st.session_state:
-    st.session_state.saved = False
+if "created_at" not in st.session_state:
+    st.session_state.created_at = ""  # 제출 시각(페이지2 완료 클릭 시 확정)
+
+if "submission_id" not in st.session_state:
+    st.session_state.submission_id = ""  # 중복방지용
+
+if "sent" not in st.session_state:
+    st.session_state.sent = False
+
+if "send_info" not in st.session_state:
+    st.session_state.send_info = None
+
+if "send_error" not in st.session_state:
+    st.session_state.send_error = None
 
 
 def reset_all():
+    st.session_state.step = 1
     st.session_state.authed = False
     st.session_state.patient = {"name": "", "dob": ""}
     st.session_state.responses = {}
-    st.session_state.saved = False
+    st.session_state.created_at = ""
+    st.session_state.submission_id = ""
+    st.session_state.sent = False
+    st.session_state.send_info = None
+    st.session_state.send_error = None
 
 
 # =========================
-# UI
+# UI 공통
 # =========================
 st.title("🧠 MG-ADL 설문")
-st.caption("1) 비밀번호/정보 → 2) 설문 → 3) 결과/저장 (Google Sheets 누적 저장)")
+st.caption("하단의 ‘완료’ 버튼으로만 다음 단계로 넘어갑니다. (사이드바 이동 없음)")
 
-with st.sidebar:
-    st.subheader("메뉴")
-    page = st.radio("이동", ["1) 이름/생년월일", "2) 설문", "3) 결과/저장"], index=0)
-    st.divider()
-    st.write("접속 상태:", "✅ 인증됨" if st.session_state.authed else "⛔ 미인증")
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("로그아웃"):
-            st.session_state.authed = False
-            st.rerun()
-    with c2:
-        if st.button("전체 초기화"):
-            reset_all()
-            st.rerun()
+progress_map = {1: 33, 2: 66, 3: 100}
+st.progress(progress_map.get(st.session_state.step, 0))
 
-# 인증 안됐으면 2/3 차단
-if not st.session_state.authed and page != "1) 이름/생년월일":
-    st.warning("먼저 1) 페이지에서 비밀번호 인증을 완료해주세요.")
-    st.stop()
+top_col1, top_col2 = st.columns([1, 1])
+with top_col1:
+    st.write(f"현재 단계: **{st.session_state.step} / 3**")
+with top_col2:
+    if st.button("전체 초기화", type="secondary"):
+        reset_all()
+        st.rerun()
+
+st.divider()
 
 
 # =========================
-# 페이지 1
+# 1) 비밀번호 + 이름/생년월일
 # =========================
-if page == "1) 이름/생년월일":
-    st.header("1) 대상자 정보 입력")
+if st.session_state.step == 1:
+    st.header("1) 접속 인증 및 대상자 정보")
 
-    if not st.session_state.authed:
-        st.info("접속 비밀번호(0712)를 입력해야 다음 단계로 진행할 수 있습니다.")
-        with st.form("auth_form"):
-            pw = st.text_input("접속 비밀번호", type="password", placeholder="0712")
-            ok = st.form_submit_button("인증")
-        if ok:
-            if pw == APP_PASSWORD:
-                st.session_state.authed = True
-                st.success("인증 완료!")
-                st.rerun()
-            else:
-                st.error("비밀번호가 올바르지 않습니다.")
-        st.stop()
-
-    with st.form("patient_form", clear_on_submit=False):
+    with st.form("page1_form"):
+        pw = st.text_input("접속 비밀번호", type="password", placeholder="0712")
         name = st.text_input("이름", value=st.session_state.patient["name"], placeholder="예: 홍길동")
         dob = st.date_input("생년월일", value=None)
-        submitted = st.form_submit_button("저장")
+        submitted = st.form_submit_button("완료 (설문으로 이동)")
 
     if submitted:
-        if not name.strip():
+        if pw != APP_PASSWORD:
+            st.error("비밀번호가 올바르지 않습니다.")
+        elif not name.strip():
             st.error("이름을 입력해주세요.")
         elif dob is None:
             st.error("생년월일을 선택해주세요.")
         else:
+            st.session_state.authed = True
             st.session_state.patient["name"] = name.strip()
             st.session_state.patient["dob"] = dob.isoformat()
-            st.session_state.saved = False
-            st.success("저장되었습니다. 사이드바에서 '2) 설문'으로 이동하세요.")
 
-    if st.session_state.patient["name"] and st.session_state.patient["dob"]:
-        st.info(f"현재 입력값 → 이름: {st.session_state.patient['name']} / 생년월일: {st.session_state.patient['dob']}")
+            # 다음 단계로
+            st.session_state.step = 2
+            st.rerun()
 
 
 # =========================
-# 페이지 2
+# 2) 설문 (하단 완료로 3페이지 이동)
 # =========================
-elif page == "2) 설문":
+elif st.session_state.step == 2:
     st.header("2) MG-ADL 설문")
 
-    if not (st.session_state.patient["name"] and st.session_state.patient["dob"]):
-        st.warning("먼저 1) 페이지에서 이름/생년월일을 입력해주세요.")
-        st.stop()
+    if not st.session_state.authed:
+        st.warning("인증 정보가 없습니다. 1단계로 돌아갑니다.")
+        st.session_state.step = 1
+        st.rerun()
 
     st.write(f"대상자: **{st.session_state.patient['name']}** (DOB: {st.session_state.patient['dob']})")
 
@@ -286,29 +280,47 @@ elif page == "2) 설문":
             score = int(selected.split("점")[0].strip())
             new_responses[item["id"]] = score
 
-        submitted = st.form_submit_button("응답 저장")
+        submitted = st.form_submit_button("완료 (결과/저장으로 이동)")
 
     if submitted:
         st.session_state.responses = new_responses
-        st.session_state.saved = False
-        total = compute_total(new_responses)
-        st.success(f"응답 저장 완료! 현재 총점: **{total} / 24**")
-        st.info("사이드바에서 '3) 결과/저장'으로 이동하세요.")
+
+        # 제출 시각 확정 + 제출ID 생성(중복방지)
+        created_at = datetime.now().isoformat(timespec="seconds")
+        st.session_state.created_at = created_at
+
+        ph = make_patient_hash(st.session_state.patient["name"], st.session_state.patient["dob"])
+        st.session_state.submission_id = make_submission_id(ph, created_at, new_responses)
+
+        # 새로운 제출이므로 전송 상태 초기화
+        st.session_state.sent = False
+        st.session_state.send_info = None
+        st.session_state.send_error = None
+
+        # 다음 단계로
+        st.session_state.step = 3
+        st.rerun()
+
+    st.divider()
+    if st.button("이전 (정보 수정)", type="secondary"):
+        st.session_state.step = 1
+        st.rerun()
 
 
 # =========================
-# 페이지 3
+# 3) 결과 + 자동 전송(버튼 없음) + 상태 창
 # =========================
 else:
-    st.header("3) 결과/저장")
+    st.header("3) 결과 및 저장 (자동 전송)")
 
     if not st.session_state.responses:
-        st.warning("먼저 2) 설문을 완료해주세요.")
-        st.stop()
+        st.warning("설문 응답이 없습니다. 2단계로 돌아갑니다.")
+        st.session_state.step = 2
+        st.rerun()
 
     name = st.session_state.patient["name"]
     dob = st.session_state.patient["dob"]
-    ph = patient_hash(name, dob)
+    ph = make_patient_hash(name, dob)
 
     total = compute_total(st.session_state.responses)
 
@@ -321,59 +333,56 @@ else:
         rows.append({"문항": item["question"], "점수": sc, "선택": item["choices"][sc]})
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-    st.divider()
-    st.subheader("Google Sheets 누적 저장(append)")
-    st.caption("‘결과 저장’을 누를 때마다 스프레드시트에 **새 행으로 누적** 저장됩니다.")
+    # 자동 전송 (중복방지: sent=True면 다시 append하지 않음)
+    if not st.session_state.sent:
+        record = {
+            "created_at": st.session_state.created_at or datetime.now().isoformat(timespec="seconds"),
+            "submission_id": st.session_state.submission_id or "",
+            "name": name,
+            "dob": dob,
+            "patient_hash": ph,
+            "total_score": total,
+        }
+        for it in ITEMS:
+            record[it["id"]] = int(st.session_state.responses.get(it["id"], 0))
 
-    # record 구성: EXPECTED_HEADER 키를 모두 포함
-    record = {
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "name": name,
-        "dob": dob,
-        "patient_hash": ph,
-        "total_score": total,
-    }
-    for it in ITEMS:
-        record[it["id"]] = int(st.session_state.responses.get(it["id"], 0))
-
-    with st.expander("연동 상태 점검"):
-        st.write("- SHEET_ID 설정:", "✅" if bool(SHEET_ID) else "⛔ 없음")
-        st.write("- GOOGLE_SERVICE_ACCOUNT 설정:", "✅" if (SA_INFO is not None) else "⛔ 없음")
-        st.write("- WORKSHEET_NAME:", WORKSHEET_NAME)
-        if SA_INFO and isinstance(SA_INFO, dict):
-            st.write("- service account:", SA_INFO.get("client_email", "(unknown)"))
-        st.caption("※ 구글시트 공유에서 서비스계정 이메일을 **편집자**로 추가했는지 확인하세요.")
-
-    colA, colB = st.columns(2)
-    with colA:
-        save_clicked = st.button("💾 결과 저장(스프레드시트)", type="primary", disabled=st.session_state.saved)
-    with colB:
-        if st.button("다시 저장 가능하게(중복방지 해제)"):
-            st.session_state.saved = False
-            st.rerun()
-
-    if save_clicked:
         try:
             info = append_record_to_sheet(record)
-            st.session_state.saved = True
-            st.success("저장 완료!")
-
-            st.write("📌 저장된 위치")
-            st.write("스프레드시트:", info["spreadsheet_title"])
-            st.write("탭(워크시트):", info["worksheet_title"])
-            if info["updated_range"]:
-                st.write("업데이트 범위:", info["updated_range"])
-
+            st.session_state.sent = True
+            st.session_state.send_info = info
+            st.session_state.send_error = None
         except Exception as e:
-            st.error("저장 실패: Secrets 설정/시트 공유 권한/SHEET_ID/탭 이름을 확인하세요.")
-            st.exception(e)
+            st.session_state.sent = False
+            st.session_state.send_info = None
+            st.session_state.send_error = repr(e)
 
     st.divider()
-    st.subheader("현재 결과 CSV 다운로드")
-    export_df = pd.DataFrame([record])
-    st.download_button(
-        "⬇️ 현재 결과 CSV 다운로드",
-        data=export_df.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=f"mgadl_{ph}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv",
-    )
+    st.subheader("전송 상태")
+
+    if st.session_state.sent:
+        st.success("전송 완료되었습니다. (중복 저장 방지 적용됨)")
+        if st.session_state.send_info:
+            st.caption(f"스프레드시트: {st.session_state.send_info.get('spreadsheet_title','')}")
+            st.caption(f"탭(워크시트): {st.session_state.send_info.get('worksheet_title','')}")
+            if st.session_state.send_info.get("updated_range"):
+                st.caption(f"업데이트 범위: {st.session_state.send_info.get('updated_range')}")
+    else:
+        st.error("전송에 실패했습니다.")
+        if st.session_state.send_error:
+            st.code(st.session_state.send_error)
+        # 전송 버튼은 없애되, 실패 시에만 '재시도'는 필요하니 제공(운영상 필수)
+        if st.button("전송 재시도", type="primary"):
+            st.session_state.sent = False
+            st.rerun()
+
+    st.divider()
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("이전 (설문 수정)", type="secondary"):
+            st.session_state.step = 2
+            st.rerun()
+    with colB:
+        if st.button("새 설문 시작", type="secondary"):
+            reset_all()
+            st.rerun()
+
